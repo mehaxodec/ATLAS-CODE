@@ -1,0 +1,191 @@
+# Generate map using Folium
+import folium
+from folium.plugins import HeatMap
+import random
+import numpy as np
+import webbrowser
+import os
+from scipy.spatial import ConvexHull
+
+# --- node loading / simulation (giữ nguyên logic của bạn) ---
+nodes = []
+file_path = "nodes_data.txt"
+if os.path.exists(file_path):
+    try:
+        with open(file_path, "r") as f:
+            lines = f.readlines()
+            for line in lines:
+                parts = line.strip().split(",")
+                if len(parts) >= 11 and parts[0] == "NODE":
+                    node_id = int(parts[1])
+                    moisture = [float(parts[2]), float(parts[3]), float(parts[4])]
+                    pressure = float(parts[5])
+                    vibration = float(parts[6])
+                    temp = float(parts[7])
+                    humidity = float(parts[8])
+                    lat = float(parts[9])
+                    lon = float(parts[10])
+                    nodes.append({"id": node_id, "moisture": moisture, "pressure": pressure, "vibration": vibration,
+                                  "temp": temp, "humidity": humidity, "lat": lat, "lon": lon})
+    except Exception as e:
+        print(f"Error reading file: {e} - falling back to simulation")
+
+if len(nodes) == 0:
+    center_lat = random.uniform(16.0, 23.0)
+    center_lon = random.uniform(102.0, 109.0)
+    for i in range(12):
+        lat = center_lat + random.uniform(-0.05, 0.05)
+        lon = center_lon + random.uniform(-0.05, 0.05)
+        moisture = [random.uniform(0.2, 0.6), random.uniform(0.18, 0.55), random.uniform(0.15, 0.5)]
+        pressure = random.uniform(20, 60)
+        vibration = random.uniform(0.05, 0.4)
+        temp = random.uniform(25, 35)
+        humidity = random.uniform(50, 90)
+        nodes.append({"id": i+1, "moisture": moisture, "pressure": pressure, "vibration": vibration,
+                      "temp": temp, "humidity": humidity, "lat": lat, "lon": lon})
+
+gnss_r = random.uniform(0.4, 0.9)
+hist_ndvi_avg = random.uniform(0.3, 0.8)
+pressure_trend = random.uniform(-0.3, 0.3)
+rain_flag = random.choice([True, False])
+
+# --- risk functions (giữ nguyên) ---
+def calculate_landslide_risk(moisture, pressure, gnss_r, vibration, ndvi_hist_avg, pressure_trend):
+    saturation = (np.mean(moisture) * 0.7) + (gnss_r * 0.3)
+    p_norm = min(pressure / 80.0, 1.0)
+    score = saturation + p_norm + vibration - 0.1
+    if ndvi_hist_avg > 0.5:
+        score -= 0.2
+    score += pressure_trend * 0.15
+    return min(max(score, 0.0), 1.0)
+
+def calculate_wildfire_risk(temp, humidity, ndvi):
+    return min(max((temp - 25)/15 * 0.5 + (1 - humidity/100) * 0.3 + (1 - ndvi) * 0.2, 0.0), 1.0)
+
+def calculate_flood_risk(moisture, pressure_trend, rain_flag):
+    return min(max(np.mean(moisture) * 0.5 + abs(pressure_trend if pressure_trend < 0 else 0) * 0.3 + (1 if rain_flag else 0) * 0.2, 0.0), 1.0)
+
+# --- tạo map ---
+center_lat = np.mean([n["lat"] for n in nodes]) if nodes else 20.0
+center_lon = np.mean([n["lon"] for n in nodes]) if nodes else 106.0
+m = folium.Map(location=[center_lat, center_lon], zoom_start=10, tiles='OpenStreetMap')
+
+# Heatmap wildfire như trước
+heat_data = [[n["lat"], n["lon"], calculate_wildfire_risk(n["temp"], n["humidity"], hist_ndvi_avg)] for n in nodes]
+HeatMap(heat_data, radius=30, blur=15, gradient={0.0: 'green', 0.4: 'lime', 0.6: 'yellow', 0.8: 'orange', 1.0: 'red'}).add_to(m)
+
+# --- Cách 1: VẼ VÙNG THEO DIỆN TÍCH TỪNG NODE (circle radius tỉ lệ risk) ---
+# scale bán kính: bạn có thể điều chỉnh min_radius (m) và max_radius (m)
+min_radius_m = 300    # khi risk gần 0
+max_radius_m = 3500   # khi risk = 1
+
+for n in nodes:
+    landslide_r = calculate_landslide_risk(n["moisture"], n["pressure"], gnss_r, n["vibration"], hist_ndvi_avg, pressure_trend)
+    # radius theo risk
+    radius = int(min_radius_m + landslide_r * (max_radius_m - min_radius_m))
+    # chỉ vẽ những node có landslide risk > ngưỡng nhỏ, tránh vẽ vòng vô nghĩa
+    if landslide_r > 0.05:
+        folium.Circle(
+            location=[n["lat"], n["lon"]],
+            radius=radius,
+            color="darkred",
+            weight=1,
+            fill=True,
+            fill_color="red",
+            fill_opacity=0.18,   # bán trong suốt: chồng lên sẽ đậm màu
+            tooltip=f"Node {n['id']} landslide risk={landslide_r:.2f}"
+        ).add_to(m)
+
+# --- Cách 2 (tuỳ chọn): Tạo hull cho các ngưỡng risk để thấy vùng cluster ---
+# danh sách thresholds (tăng dần) - vẽ từ thấp -> cao để layer cao hơn phủ lên
+thresholds = [0.6, 0.7, 0.8]  # bạn có thể sửa
+fill_opacities = {0.6: 0.16, 0.7: 0.22, 0.8: 0.30}
+
+def build_hull_latlon(points_latlon):
+    """Trả về danh sách tọa độ [lat, lon] theo thứ tự hull; None nếu <3 điểm."""
+    if len(points_latlon) < 3:
+        return None
+    arr = np.array([[p[1], p[0]] for p in points_latlon])  # [lon, lat] cho ConvexHull
+    try:
+        hull = ConvexHull(arr)
+        coords = [[arr[v][1], arr[v][0]] for v in hull.vertices]  # chuyển về [lat, lon]
+        coords.append(coords[0])  # đóng vòng
+        return coords
+    except Exception:
+        return None
+
+for t in thresholds:
+    pts = [[n["lat"], n["lon"]] for n in nodes if calculate_landslide_risk(n["moisture"], n["pressure"], gnss_r, n["vibration"], hist_ndvi_avg, pressure_trend) >= t]
+    hull_coords = build_hull_latlon(pts)
+    if hull_coords:
+        folium.Polygon(
+            locations=hull_coords,
+            color="darkred",
+            weight=2,
+            fill=True,
+            fill_color="red",
+            fill_opacity=fill_opacities.get(t, 0.2),
+            tooltip=f"Landslide hull >= {t}"
+        ).add_to(m)
+
+# --- các phần còn lại (flood polygon, hull outline, markers) giữ nguyên logic cũ nhưng mình sẽ thêm vòng marker thay vì CircleMarker) ---
+
+# Flood polygon (giữ cách bạn muốn: mình giữ nguyên cơ bản)
+flood_points = [[n["lat"], n["lon"]] for n in nodes if calculate_flood_risk(n["moisture"], pressure_trend, rain_flag) > 0.6]
+if len(flood_points) > 2:
+    try:
+        arr = np.array([[p[1], p[0]] for p in flood_points])
+        hull = ConvexHull(arr)
+        hull_coords = [[arr[i][1], arr[i][0]] for i in hull.vertices]
+        hull_coords.append(hull_coords[0])
+        folium.Polygon(hull_coords, color="darkblue", weight=3, fill=True, fill_color="blue", fill_opacity=0.22, tooltip="Flood High Risk Zone").add_to(m)
+    except Exception:
+        folium.Polygon(flood_points, color="darkblue", weight=3, fill=True, fill_color="blue", fill_opacity=0.22, tooltip="Flood High Risk Zone").add_to(m)
+
+# Hull outline tổng thể
+hull_points = [[n["lat"], n["lon"]] for n in nodes]
+if len(hull_points) > 2:
+    try:
+        arr = np.array([[p[1], p[0]] for p in hull_points])
+        hull = ConvexHull(arr)
+        hull_coords = [[arr[i][1], arr[i][0]] for i in hull.vertices]
+        hull_coords.append(hull_coords[0])
+        folium.PolyLine(hull_coords, color="black", weight=2, dash_array='10', tooltip="Nodes Coverage Outline").add_to(m)
+    except Exception:
+        folium.PolyLine(hull_points, color="black", weight=2, dash_array='10', tooltip="Nodes Coverage Outline").add_to(m)
+
+# Circles/markers per node (popup)
+for n in nodes:
+    landslide_n = calculate_landslide_risk(n["moisture"], n["pressure"], gnss_r, n["vibration"], hist_ndvi_avg, pressure_trend)
+    flood_n = calculate_flood_risk(n["moisture"], pressure_trend, rain_flag)
+    wildfire_n = calculate_wildfire_risk(n["temp"], n["humidity"], hist_ndvi_avg)
+
+    dominant_risk = max(landslide_n, flood_n, wildfire_n)
+    color = 'green' if dominant_risk < 0.6 else 'orange' if dominant_risk < 0.8 else 'red'
+
+    folium.CircleMarker(
+        location=[n["lat"], n["lon"]],
+        radius=8,
+        color='black',
+        fill=True,
+        fill_color=color,
+        fill_opacity=0.9,
+        popup=folium.Popup(f"<b>Node {n['id']}</b><br>"
+                           f"Landslide Risk: {landslide_n:.2f}<br>"
+                           f"Flood Risk: {flood_n:.2f}<br>"
+                           f"Wildfire Risk: {wildfire_n:.2f}<br>"
+                           f"Moisture Avg: {np.mean(n['moisture']):.2f}<br>"
+                           f"Pressure: {n['pressure']:.1f} kPa", max_width=300)
+    ).add_to(m)
+
+# Title + notes
+title_html = '<h3 align="center" style="font-size:20px"><b>ASCEND Multi-Disaster Risk Map (12 Nodes - density-based landslide areas)</b></h3>'
+m.get_root().html.add_child(folium.Element(title_html))
+
+notes_html = '<p align="center" style="font-size:12px">Notes: Vòng đỏ quanh mỗi node tỉ lệ với landslide risk; hulls theo ngưỡng (>=0.6/0.7/0.8). Heatmap = Wildfire. Circles per node multi-risk.</p>'
+m.get_root().html.add_child(folium.Element(notes_html))
+
+map_file = 'ascend_multi_risk_map_radius.html'
+m.save(map_file)
+print(f"Interactive map exported: {map_file}")
+webbrowser.open('file://' + os.path.realpath(map_file))
